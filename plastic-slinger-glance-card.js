@@ -1,4 +1,4 @@
-// plastic-slinger-glance-card v1.1.0 — compact 2xX 16:9 active-print camera glance grid
+// plastic-slinger-glance-card v1.1.1 — compact 2xX 16:9 active-print camera glance grid
 // with native popup printer control modal (Pause, Resume, Cancel, Chamber Light,
 // Auto-Unload, and 2D bed-map Skip Part).
 //
@@ -8,21 +8,14 @@
 // via `hass.fetchWithAuth`, so it works natively in browsers and the Home
 // Assistant Mobile Companion App over LAN, Nabu Casa, or reverse proxies without
 // iframes or Ingress session cookies.
-//
-// Status accent colors (Printing, Complete, Paused, Failed) and tile sorting
-// (Default vs. Completion Time) are configured in the Plastic Slinger app under
-// Settings -> Printer status colors & active prints glance, and arrive in the
-// sensor's `status_colors` and `printers` attributes automatically.
-//
-// Config:
-//   entity:            sensor entity id (default "sensor.plastic_slinger_active_prints")
-//   tap_url:           optional path or URL to open instead of the built-in control modal
-//                      when tapping a printing/paused tile (default null -> opens modal)
-//   snapshot_interval: seconds between camera snapshot refreshes while visible
-//                      (default 5, clamped 2..60; modal refreshes active printer every 2s)
-//   columns:           grid columns, 1 or 2 (default 2)
-//   show_empty:        show a compact "All printers idle" card when no tiles are
-//                      active or held (default true; false collapses the card)
+
+const CARD_VERSION = "1.1.1";
+
+console.info(
+  `%c PLASTIC-SLINGER-GLANCE-CARD %c v${CARD_VERSION} `,
+  "background:#8b4ce8;color:#fff;font-weight:700;padding:2px 6px;border-radius:4px 0 0 4px;",
+  "background:#202024;color:#f4f4f6;font-weight:700;padding:2px 6px;border-radius:0 4px 4px 0;"
+);
 
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -40,6 +33,445 @@ const NEXT_UNLOAD_MODE = {
   always: "off",
 };
 
+const MODAL_STYLES = `
+  :host {
+    all: initial;
+    font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 99999;
+    background: rgba(9, 9, 12, 0.84);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 14px;
+    box-sizing: border-box;
+    font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+    color: #f4f4f6;
+  }
+  .modal-card {
+    --ps-teal: #14967f;
+    --ps-teal-bright: #2dd4bf;
+    --ps-bg: #18181b;
+    --ps-surface: #202024;
+    --ps-elevated: #28282d;
+    --ps-border: #34343b;
+    --ps-text: #f4f4f6;
+    --ps-muted: #9ca3af;
+    width: 100%;
+    max-width: 580px;
+    max-height: calc(100vh - 28px);
+    overflow-y: auto;
+    background: var(--ps-surface);
+    border: 1.5px solid color-mix(in srgb, var(--tile-accent, #8b4ce8) 75%, var(--ps-border));
+    border-radius: 14px;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.75);
+    display: flex;
+    flex-direction: column;
+    color: var(--ps-text);
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .modal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 10px 12px;
+    background: color-mix(in srgb, var(--tile-accent, #8b4ce8) 18%, var(--ps-elevated));
+    border-bottom: 1px solid color-mix(in srgb, var(--tile-accent, #8b4ce8) 35%, var(--ps-border));
+  }
+  .modal-title-group {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    flex: none;
+    background: var(--tile-accent, #8b4ce8);
+    box-shadow: 0 0 6px var(--tile-accent, #8b4ce8);
+  }
+  .modal-name {
+    font-size: 15px;
+    font-weight: 800;
+    color: var(--ps-text);
+  }
+  .modal-badge {
+    font-size: 10.5px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    color: #d1d5db;
+  }
+  .status {
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    padding: 2px 7px;
+    border-radius: 999px;
+    color: #fff;
+    background: color-mix(in srgb, var(--tile-accent, #8b4ce8) 82%, #000);
+    border: 1px solid color-mix(in srgb, var(--tile-accent, #8b4ce8) 60%, #fff);
+    line-height: 1.2;
+  }
+  .modal-head-btns {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: none;
+  }
+  .icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    border: 1px solid var(--ps-border);
+    background: var(--ps-bg);
+    color: var(--ps-text);
+    font-size: 15px;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  .icon-btn:hover {
+    background: var(--ps-elevated);
+  }
+  .icon-btn.light-on {
+    background: rgba(245, 158, 11, 0.22);
+    border-color: #f59e0b;
+    color: #fde68a;
+    box-shadow: 0 0 10px rgba(245, 158, 11, 0.35);
+  }
+  .cam {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background-color: #121215;
+    background-image:
+      linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+    background-size: 16px 16px;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .cam-placeholder {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.28);
+    pointer-events: none;
+  }
+  .cam-img {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+  .cam-img.loaded {
+    opacity: 1;
+  }
+  .temp-overlay {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    z-index: 2;
+    pointer-events: none;
+  }
+  .temp-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 8px;
+    border-radius: 7px;
+    font-size: 11px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    background: rgba(15, 15, 18, 0.84);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    color: var(--ps-text);
+    backdrop-filter: blur(4px);
+  }
+  .temp-pill.heating {
+    border-color: rgba(249, 115, 22, 0.65);
+  }
+  .temp-label {
+    color: var(--ps-muted);
+    font-weight: 600;
+  }
+  .layer-pill {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    padding: 3px 8px;
+    border-radius: 7px;
+    font-size: 11px;
+    font-weight: 700;
+    background: rgba(15, 15, 18, 0.84);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    color: #e5e7eb;
+    z-index: 2;
+  }
+  .modal-progress {
+    position: relative;
+    min-height: 32px;
+    background: var(--ps-bg);
+    border-top: 1px solid var(--ps-border);
+    border-bottom: 1px solid var(--ps-border);
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+  }
+  .fill {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: var(--progress, 0%);
+    background: linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--tile-accent, #8b4ce8) 42%, transparent),
+      color-mix(in srgb, var(--tile-accent, #8b4ce8) 68%, transparent)
+    );
+    border-right: 1.5px solid var(--tile-accent, #8b4ce8);
+    transition: width 0.3s ease;
+  }
+  .modal-progress-text {
+    position: relative;
+    z-index: 1;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 6px 12px;
+    font-size: 12px;
+  }
+  .modal-file {
+    font-weight: 600;
+    color: var(--ps-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+    flex: 1;
+  }
+  .modal-eta {
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: #e5e7eb;
+    flex: none;
+  }
+  .modal-deck {
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    background: var(--ps-surface);
+  }
+  .action-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 8px;
+  }
+  .pill-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 36px;
+    padding: 0 12px;
+    border-radius: 8px;
+    border: 1px solid var(--ps-border);
+    background: var(--ps-elevated);
+    color: var(--ps-text);
+    font-size: 12.5px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  .pill-btn:hover:not(:disabled) {
+    background: #323238;
+  }
+  .pill-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .pill-btn.warn {
+    background: rgba(243, 121, 32, 0.16);
+    border-color: rgba(243, 121, 32, 0.55);
+    color: #fdba74;
+  }
+  .pill-btn.ok {
+    background: rgba(28, 168, 122, 0.18);
+    border-color: rgba(28, 168, 122, 0.6);
+    color: #6ee7b7;
+  }
+  .pill-btn.danger {
+    background: rgba(227, 52, 42, 0.16);
+    border-color: rgba(227, 52, 42, 0.55);
+    color: #fca5a5;
+  }
+  .pill-btn.active-once {
+    background: rgba(20, 150, 127, 0.22);
+    border-color: var(--ps-teal-bright);
+    color: var(--ps-teal-bright);
+  }
+  .pill-btn.active-always {
+    background: rgba(139, 76, 232, 0.22);
+    border-color: #a855f7;
+    color: #d8b4fe;
+  }
+  .confirm-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 9px 11px;
+    border-radius: 9px;
+    background: rgba(227, 52, 42, 0.12);
+    border: 1px solid rgba(227, 52, 42, 0.45);
+    font-size: 12.5px;
+  }
+  .confirm-bar.warn {
+    background: rgba(243, 121, 32, 0.12);
+    border-color: rgba(243, 121, 32, 0.45);
+  }
+  .confirm-btns {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .notice-bar {
+    padding: 7px 10px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .notice-bar.ok {
+    background: rgba(28, 168, 122, 0.15);
+    border: 1px solid rgba(28, 168, 122, 0.5);
+    color: #6ee7b7;
+  }
+  .notice-bar.err {
+    background: rgba(227, 52, 42, 0.15);
+    border: 1px solid rgba(227, 52, 42, 0.5);
+    color: #fca5a5;
+  }
+  .skip-drawer {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 10px;
+    border-radius: 10px;
+    background: var(--ps-bg);
+    border: 1px solid var(--ps-border);
+  }
+  .skip-grid {
+    display: grid;
+    grid-template-columns: 180px 1fr;
+    gap: 10px;
+    align-items: stretch;
+  }
+  @media (max-width: 480px) {
+    .skip-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+  .skip-map {
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    background: #121215;
+    border: 1px solid var(--ps-border);
+    border-radius: 8px;
+  }
+  .skip-bed {
+    fill: #18181c;
+    stroke: #34343b;
+    stroke-width: 1.5;
+  }
+  .skip-part {
+    fill: rgba(45, 212, 191, 0.25);
+    stroke: #2dd4bf;
+    stroke-width: 1.5;
+    cursor: pointer;
+    transition: fill 0.12s ease;
+  }
+  .skip-part.is-current {
+    fill: rgba(139, 76, 232, 0.38);
+    stroke: #a855f7;
+  }
+  .skip-part.is-selected {
+    fill: rgba(227, 52, 42, 0.45);
+    stroke: #f87171;
+  }
+  .skip-part.is-excluded {
+    fill: rgba(107, 114, 128, 0.18);
+    stroke: #4b5563;
+    cursor: default;
+  }
+  .skip-list {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    max-height: 180px;
+    overflow-y: auto;
+  }
+  .skip-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    padding: 6px 9px;
+    border-radius: 7px;
+    border: 1px solid var(--ps-border);
+    background: var(--ps-surface);
+    color: var(--ps-text);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    text-align: left;
+  }
+  .skip-item.is-selected {
+    border-color: #f87171;
+    background: rgba(227, 52, 42, 0.16);
+  }
+  .skip-item.is-excluded {
+    opacity: 0.48;
+    text-decoration: line-through;
+    cursor: default;
+  }
+  .skip-tag {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.1);
+    color: #d1d5db;
+    flex: none;
+  }
+  .skip-tag.now {
+    background: rgba(45, 212, 191, 0.2);
+    color: #2dd4bf;
+  }
+`;
+
 class PlasticSlingerGlanceCard extends HTMLElement {
   constructor() {
     super();
@@ -56,6 +488,8 @@ class PlasticSlingerGlanceCard extends HTMLElement {
     this._modalSkipSelected = new Set();
     this._modalBusy = false;
     this._modalNotice = null;
+    this._portalHost = null;
+    this._portalRoot = null;
     this._onVisChange = () => {
       this._syncTimer();
       this._syncModalTimer();
@@ -95,7 +529,6 @@ class PlasticSlingerGlanceCard extends HTMLElement {
       for (const id of [...this._dismissedIds]) {
         if (!currentIds.has(id)) this._dismissedIds.delete(id);
       }
-      // Clear optimistic overrides once fresh state arrives
       this._optimistic.clear();
       if (this._modalPrinterId != null && !currentIds.has(this._modalPrinterId)) {
         this._closeModal(false);
@@ -132,6 +565,7 @@ class PlasticSlingerGlanceCard extends HTMLElement {
     document.removeEventListener("keydown", this._onKeyDown);
     this._stopTimer();
     this._stopModalTimer();
+    this._destroyPortal();
     for (const url of this._blobUrls.values()) {
       try {
         URL.revokeObjectURL(url);
@@ -139,6 +573,29 @@ class PlasticSlingerGlanceCard extends HTMLElement {
     }
     this._blobUrls.clear();
     this._heldFetched.clear();
+  }
+
+  _ensurePortal() {
+    if (this._portalRoot && this._portalHost?.isConnected) {
+      return this._portalRoot;
+    }
+    this._destroyPortal();
+    const host = document.createElement("div");
+    host.setAttribute("data-ps-glance-portal", "1");
+    document.body.appendChild(host);
+    this._portalHost = host;
+    this._portalRoot = host.attachShadow({ mode: "open" });
+    return this._portalRoot;
+  }
+
+  _destroyPortal() {
+    if (this._portalHost) {
+      try {
+        this._portalHost.remove();
+      } catch {}
+    }
+    this._portalHost = null;
+    this._portalRoot = null;
   }
 
   _syncTimer() {
@@ -260,8 +717,9 @@ class PlasticSlingerGlanceCard extends HTMLElement {
         } catch {}
       }
 
-      if (this.shadowRoot) {
-        for (const img of this.shadowRoot.querySelectorAll(`img[data-printer-id="${printerId}"]`)) {
+      for (const root of [this.shadowRoot, this._portalRoot]) {
+        if (!root) continue;
+        for (const img of root.querySelectorAll(`img[data-printer-id="${printerId}"]`)) {
           img.src = newUrl;
           img.classList.add("loaded");
         }
@@ -295,7 +753,7 @@ class PlasticSlingerGlanceCard extends HTMLElement {
     this._modalBusy = false;
     this._modalNotice = null;
     this._syncModalTimer();
-    this._render();
+    this._renderModalPortal();
     this._fetchOneSnapshot(id, false);
   }
 
@@ -307,6 +765,7 @@ class PlasticSlingerGlanceCard extends HTMLElement {
     this._modalBusy = false;
     this._modalNotice = null;
     this._stopModalTimer();
+    this._destroyPortal();
     if (shouldRender) this._render();
   }
 
@@ -371,6 +830,7 @@ class PlasticSlingerGlanceCard extends HTMLElement {
 
     if (stateObj && printers.length === 0 && this._config.show_empty === false) {
       this.shadowRoot.innerHTML = `<style>:host { display: none; }</style>`;
+      this._destroyPortal();
       return;
     }
 
@@ -399,12 +859,6 @@ class PlasticSlingerGlanceCard extends HTMLElement {
           ${printers.map((p) => this._renderTile(p)).join("")}
         </div>`;
     }
-
-    const modalPrinter =
-      this._modalPrinterId != null
-        ? printers.find((p) => Number(p.id) === this._modalPrinterId) || null
-        : null;
-    const modalHtml = modalPrinter ? this._renderModal(modalPrinter) : "";
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -479,10 +933,10 @@ class PlasticSlingerGlanceCard extends HTMLElement {
         .tile.clickable:active {
           transform: scale(0.988);
         }
-        .tile.is-printing, .modal-card.is-printing { --tile-accent: var(--glance-printing); }
-        .tile.is-complete, .modal-card.is-complete { --tile-accent: var(--glance-complete); }
-        .tile.is-paused,   .modal-card.is-paused   { --tile-accent: var(--glance-paused); }
-        .tile.is-failed,   .modal-card.is-failed   { --tile-accent: var(--glance-failed); }
+        .tile.is-printing { --tile-accent: var(--glance-printing); }
+        .tile.is-complete { --tile-accent: var(--glance-complete); }
+        .tile.is-paused   { --tile-accent: var(--glance-paused); }
+        .tile.is-failed   { --tile-accent: var(--glance-failed); }
 
         .head {
           display: flex;
@@ -645,372 +1099,28 @@ class PlasticSlingerGlanceCard extends HTMLElement {
           overflow: hidden;
           text-overflow: ellipsis;
         }
-
-        /* Native Printer Control Modal */
-        .modal-backdrop {
-          position: fixed;
-          inset: 0;
-          z-index: 9999;
-          background: rgba(9, 9, 12, 0.82);
-          backdrop-filter: blur(6px);
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          padding: 14px;
-          box-sizing: border-box;
-        }
-        .modal-card {
-          width: 100%;
-          max-width: 580px;
-          max-height: calc(100vh - 28px);
-          overflow-y: auto;
-          background: var(--ps-surface);
-          border: 1.5px solid color-mix(in srgb, var(--tile-accent) 75%, var(--ps-border));
-          border-radius: 14px;
-          box-shadow: 0 18px 48px rgba(0, 0, 0, 0.72);
-          display: flex;
-          flex-direction: column;
-          color: var(--ps-text);
-        }
-        .modal-head {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 8px;
-          padding: 10px 12px;
-          background: color-mix(in srgb, var(--tile-accent) 18%, var(--ps-elevated));
-          border-bottom: 1px solid color-mix(in srgb, var(--tile-accent) 35%, var(--ps-border));
-        }
-        .modal-title-group {
-          display: flex;
-          align-items: center;
-          gap: 7px;
-          flex-wrap: wrap;
-          min-width: 0;
-        }
-        .modal-name {
-          font-size: 15px;
-          font-weight: 800;
-          color: var(--ps-text);
-        }
-        .modal-badge {
-          font-size: 10.5px;
-          font-weight: 600;
-          padding: 2px 7px;
-          border-radius: 6px;
-          background: rgba(255, 255, 255, 0.08);
-          border: 1px solid rgba(255, 255, 255, 0.14);
-          color: #d1d5db;
-        }
-        .modal-head-btns {
-          display: flex;
-          align-items: center;
-          gap: 6px;
-          flex: none;
-        }
-        .icon-btn {
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          width: 32px;
-          height: 32px;
-          border-radius: 8px;
-          border: 1px solid var(--ps-border);
-          background: var(--ps-bg);
-          color: var(--ps-text);
-          font-size: 15px;
-          cursor: pointer;
-          transition: background 0.15s ease, border-color 0.15s ease;
-        }
-        .icon-btn:hover {
-          background: var(--ps-elevated);
-        }
-        .icon-btn.light-on {
-          background: rgba(245, 158, 11, 0.22);
-          border-color: #f59e0b;
-          color: #fde68a;
-          box-shadow: 0 0 10px rgba(245, 158, 11, 0.35);
-        }
-        .temp-overlay {
-          position: absolute;
-          top: 8px;
-          left: 8px;
-          display: flex;
-          flex-wrap: wrap;
-          gap: 6px;
-          z-index: 2;
-          pointer-events: none;
-        }
-        .temp-pill {
-          display: inline-flex;
-          align-items: center;
-          gap: 5px;
-          padding: 3px 8px;
-          border-radius: 7px;
-          font-size: 11px;
-          font-weight: 700;
-          font-variant-numeric: tabular-nums;
-          background: rgba(15, 15, 18, 0.84);
-          border: 1px solid rgba(255, 255, 255, 0.16);
-          color: var(--ps-text);
-          backdrop-filter: blur(4px);
-        }
-        .temp-pill.heating {
-          border-color: rgba(249, 115, 22, 0.65);
-        }
-        .temp-label {
-          color: var(--ps-muted);
-          font-weight: 600;
-        }
-        .layer-pill {
-          position: absolute;
-          top: 8px;
-          right: 8px;
-          padding: 3px 8px;
-          border-radius: 7px;
-          font-size: 11px;
-          font-weight: 700;
-          background: rgba(15, 15, 18, 0.84);
-          border: 1px solid rgba(255, 255, 255, 0.16);
-          color: #e5e7eb;
-          z-index: 2;
-        }
-        .modal-progress {
-          position: relative;
-          min-height: 32px;
-          background: var(--ps-bg);
-          border-top: 1px solid var(--ps-border);
-          border-bottom: 1px solid var(--ps-border);
-          overflow: hidden;
-          display: flex;
-          align-items: center;
-        }
-        .modal-progress-text {
-          position: relative;
-          z-index: 1;
-          width: 100%;
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 10px;
-          padding: 6px 12px;
-          font-size: 12px;
-        }
-        .modal-file {
-          font-weight: 600;
-          color: var(--ps-text);
-          white-space: nowrap;
-          overflow: hidden;
-          text-overflow: ellipsis;
-          min-width: 0;
-          flex: 1;
-        }
-        .modal-eta {
-          font-weight: 700;
-          font-variant-numeric: tabular-nums;
-          color: #e5e7eb;
-          flex: none;
-        }
-        .modal-deck {
-          padding: 12px;
-          display: flex;
-          flex-direction: column;
-          gap: 10px;
-          background: var(--ps-surface);
-        }
-        .action-row {
-          display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
-          gap: 8px;
-        }
-        .pill-btn {
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          gap: 6px;
-          height: 36px;
-          padding: 0 12px;
-          border-radius: 8px;
-          border: 1px solid var(--ps-border);
-          background: var(--ps-elevated);
-          color: var(--ps-text);
-          font-size: 12.5px;
-          font-weight: 700;
-          cursor: pointer;
-          transition: background 0.15s ease, border-color 0.15s ease;
-        }
-        .pill-btn:hover:not(:disabled) {
-          background: #323238;
-        }
-        .pill-btn:disabled {
-          opacity: 0.5;
-          cursor: default;
-        }
-        .pill-btn.warn {
-          background: rgba(243, 121, 32, 0.16);
-          border-color: rgba(243, 121, 32, 0.55);
-          color: #fdba74;
-        }
-        .pill-btn.ok {
-          background: rgba(28, 168, 122, 0.18);
-          border-color: rgba(28, 168, 122, 0.6);
-          color: #6ee7b7;
-        }
-        .pill-btn.danger {
-          background: rgba(227, 52, 42, 0.16);
-          border-color: rgba(227, 52, 42, 0.55);
-          color: #fca5a5;
-        }
-        .pill-btn.active-once {
-          background: rgba(20, 150, 127, 0.22);
-          border-color: var(--ps-teal-bright);
-          color: var(--ps-teal-bright);
-        }
-        .pill-btn.active-always {
-          background: rgba(139, 76, 232, 0.22);
-          border-color: #a855f7;
-          color: #d8b4fe;
-        }
-        .confirm-bar {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          flex-wrap: wrap;
-          gap: 8px;
-          padding: 9px 11px;
-          border-radius: 9px;
-          background: rgba(227, 52, 42, 0.12);
-          border: 1px solid rgba(227, 52, 42, 0.45);
-          font-size: 12.5px;
-        }
-        .confirm-bar.warn {
-          background: rgba(243, 121, 32, 0.12);
-          border-color: rgba(243, 121, 32, 0.45);
-        }
-        .confirm-btns {
-          display: flex;
-          align-items: center;
-          gap: 6px;
-        }
-        .notice-bar {
-          padding: 7px 10px;
-          border-radius: 8px;
-          font-size: 12px;
-          font-weight: 600;
-        }
-        .notice-bar.ok {
-          background: rgba(28, 168, 122, 0.15);
-          border: 1px solid rgba(28, 168, 122, 0.5);
-          color: #6ee7b7;
-        }
-        .notice-bar.err {
-          background: rgba(227, 52, 42, 0.15);
-          border: 1px solid rgba(227, 52, 42, 0.5);
-          color: #fca5a5;
-        }
-
-        /* Skip Part Drawer (2D SVG Bed Map + Parts List) */
-        .skip-drawer {
-          display: flex;
-          flex-direction: column;
-          gap: 10px;
-          padding: 10px;
-          border-radius: 10px;
-          background: var(--ps-bg);
-          border: 1px solid var(--ps-border);
-        }
-        .skip-grid {
-          display: grid;
-          grid-template-columns: 180px 1fr;
-          gap: 10px;
-          align-items: stretch;
-        }
-        @media (max-width: 480px) {
-          .skip-grid {
-            grid-template-columns: 1fr;
-          }
-        }
-        .skip-map {
-          width: 100%;
-          aspect-ratio: 1 / 1;
-          background: #121215;
-          border: 1px solid var(--ps-border);
-          border-radius: 8px;
-        }
-        .skip-bed {
-          fill: #18181c;
-          stroke: #34343b;
-          stroke-width: 1.5;
-        }
-        .skip-part {
-          fill: rgba(45, 212, 191, 0.25);
-          stroke: #2dd4bf;
-          stroke-width: 1.5;
-          cursor: pointer;
-          transition: fill 0.12s ease;
-        }
-        .skip-part.is-current {
-          fill: rgba(139, 76, 232, 0.38);
-          stroke: #a855f7;
-        }
-        .skip-part.is-selected {
-          fill: rgba(227, 52, 42, 0.45);
-          stroke: #f87171;
-        }
-        .skip-part.is-excluded {
-          fill: rgba(107, 114, 128, 0.18);
-          stroke: #4b5563;
-          cursor: default;
-        }
-        .skip-list {
-          display: flex;
-          flex-direction: column;
-          gap: 5px;
-          max-height: 180px;
-          overflow-y: auto;
-        }
-        .skip-item {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 6px;
-          padding: 6px 9px;
-          border-radius: 7px;
-          border: 1px solid var(--ps-border);
-          background: var(--ps-surface);
-          color: var(--ps-text);
-          font-size: 12px;
-          font-weight: 600;
-          cursor: pointer;
-          text-align: left;
-        }
-        .skip-item.is-selected {
-          border-color: #f87171;
-          background: rgba(227, 52, 42, 0.16);
-        }
-        .skip-item.is-excluded {
-          opacity: 0.48;
-          text-decoration: line-through;
-          cursor: default;
-        }
-        .skip-tag {
-          font-size: 10px;
-          font-weight: 700;
-          padding: 1px 6px;
-          border-radius: 999px;
-          background: rgba(255, 255, 255, 0.1);
-          color: #d1d5db;
-          flex: none;
-        }
-        .skip-tag.now {
-          background: rgba(45, 212, 191, 0.2);
-          color: #2dd4bf;
-        }
       </style>
-      <ha-card>${bodyHtml}</ha-card>
-      ${modalHtml}`;
+      <ha-card>${bodyHtml}</ha-card>`;
 
-    this._bindEvents();
+    this._bindTileEvents();
+    this._renderModalPortal();
+  }
+
+  _renderModalPortal() {
+    if (this._modalPrinterId == null) {
+      this._destroyPortal();
+      return;
+    }
+    const printers = this._visiblePrinters();
+    const modalPrinter = printers.find((p) => Number(p.id) === this._modalPrinterId) || null;
+    if (!modalPrinter) {
+      this._closeModal(false);
+      return;
+    }
+    const root = this._ensurePortal();
+    const colors = this._statusColors();
+    root.innerHTML = `<style>${MODAL_STYLES}</style>${this._renderModal(modalPrinter, colors)}`;
+    this._bindModalEvents(root);
   }
 
   _renderTile(p) {
@@ -1029,7 +1139,7 @@ class PlasticSlingerGlanceCard extends HTMLElement {
     const transform = this._cameraTransform(p);
     const canDismiss = Boolean(p.can_dismiss);
     const isControllable = status === "printing" || status === "paused";
-    const clickable = status === "complete" || isControllable || Boolean(this._config?.tap_url);
+    const clickable = status === "complete" || isControllable;
     const title =
       status === "complete"
         ? `${p.name} · ${p.status_label || "COMPLETE"} · Tap to clear`
@@ -1075,17 +1185,17 @@ class PlasticSlingerGlanceCard extends HTMLElement {
       </div>`;
   }
 
-  _renderModal(p) {
+  _renderModal(p, colors) {
     const id = Number(p.id);
     const status = String(p.status || "printing").toLowerCase();
-    const statusClass =
+    const accent =
       status === "complete"
-        ? "is-complete"
+        ? colors.complete
         : status === "paused"
-          ? "is-paused"
+          ? colors.paused
           : status === "failed"
-            ? "is-failed"
-            : "is-printing";
+            ? colors.failed
+            : colors.printing;
     const prog = Math.max(0, Math.min(100, Number(p.progress_percent ?? 0)));
     const blobUrl = this._blobUrls.get(id) || "";
     const transform = this._cameraTransform(p);
@@ -1163,7 +1273,7 @@ class PlasticSlingerGlanceCard extends HTMLElement {
 
     return `
       <div class="modal-backdrop" data-modal-backdrop="1">
-        <div class="modal-card ${statusClass}" role="dialog" aria-modal="true" aria-label="${esc(p.name)} controls">
+        <div class="modal-card" style="--tile-accent: ${esc(accent)}" role="dialog" aria-modal="true" aria-label="${esc(p.name)} controls">
           <div class="modal-head">
             <div class="modal-title-group">
               <span class="dot" aria-hidden="true"></span>
@@ -1176,6 +1286,11 @@ class PlasticSlingerGlanceCard extends HTMLElement {
               ${
                 p.has_chamber_light
                   ? `<button type="button" class="icon-btn ${p.chamber_light_on ? "light-on" : ""}" data-modal-action="toggle-light" title="${p.chamber_light_on ? "Turn chamber light off" : "Turn chamber light on"}" aria-label="Toggle chamber light" ${this._modalBusy ? "disabled" : ""}>💡</button>`
+                  : ""
+              }
+              ${
+                this._config?.tap_url
+                  ? `<button type="button" class="icon-btn" data-modal-action="open-tap-url" title="Open in Plastic Slinger" aria-label="Open in Plastic Slinger">↗</button>`
                   : ""
               }
               <button type="button" class="icon-btn" data-modal-action="close" title="Close" aria-label="Close">×</button>
@@ -1243,7 +1358,6 @@ class PlasticSlingerGlanceCard extends HTMLElement {
     const radius = Math.max(width, height) * 0.03;
     const svgY = (y) => maxY - Number(y);
 
-    // Keep only non-excluded parts in selection
     for (const name of [...this._modalSkipSelected]) {
       const obj = objects.find((o) => o.name === name);
       if (!obj || obj.is_excluded) this._modalSkipSelected.delete(name);
@@ -1333,29 +1447,36 @@ class PlasticSlingerGlanceCard extends HTMLElement {
       </div>`;
   }
 
-  _bindEvents() {
+  _bindTileEvents() {
     if (!this.shadowRoot) return;
     for (const btn of this.shadowRoot.querySelectorAll("button[data-dismiss-id]")) {
       btn.addEventListener("click", (ev) => {
+        ev.preventDefault();
         ev.stopPropagation();
         this._dismissPrinter(btn.dataset.dismissId);
       });
     }
     for (const tile of this.shadowRoot.querySelectorAll(".tile[data-tile-id]")) {
-      tile.addEventListener("click", () => {
+      tile.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
         const id = tile.dataset.tileId;
         const status = tile.dataset.tileStatus;
         if (status === "complete") {
           this._dismissPrinter(id);
+        } else if (status === "printing" || status === "paused") {
+          // Always open the native printer control modal for printing/paused tiles
+          this._openModal(id);
         } else if (this._config?.tap_url) {
           this._openTapUrl(id);
-        } else if (status === "printing" || status === "paused") {
-          this._openModal(id);
         }
       });
     }
+  }
 
-    const backdrop = this.shadowRoot.querySelector(".modal-backdrop[data-modal-backdrop]");
+  _bindModalEvents(root) {
+    if (!root) return;
+    const backdrop = root.querySelector(".modal-backdrop[data-modal-backdrop]");
     if (backdrop) {
       backdrop.addEventListener("click", (ev) => {
         if (ev.target === backdrop) {
@@ -1364,15 +1485,17 @@ class PlasticSlingerGlanceCard extends HTMLElement {
       });
     }
 
-    for (const el of this.shadowRoot.querySelectorAll("[data-modal-action]")) {
+    for (const el of root.querySelectorAll("[data-modal-action]")) {
       el.addEventListener("click", (ev) => {
+        ev.preventDefault();
         ev.stopPropagation();
         this._handleModalAction(el.dataset.modalAction);
       });
     }
 
-    for (const partEl of this.shadowRoot.querySelectorAll("[data-skip-part]")) {
+    for (const partEl of root.querySelectorAll("[data-skip-part]")) {
       partEl.addEventListener("click", (ev) => {
+        ev.preventDefault();
         ev.stopPropagation();
         const name = partEl.dataset.skipPart;
         if (!name || this._modalBusy) return;
@@ -1385,7 +1508,7 @@ class PlasticSlingerGlanceCard extends HTMLElement {
           this._modalSkipSelected.add(name);
         }
         this._modalConfirm = null;
-        this._render();
+        this._renderModalPortal();
       });
     }
   }
@@ -1400,26 +1523,30 @@ class PlasticSlingerGlanceCard extends HTMLElement {
       case "close":
         this._closeModal();
         break;
+      case "open-tap-url":
+        this._closeModal();
+        this._openTapUrl(id);
+        break;
       case "prompt-pause":
         this._modalConfirm = "pause";
         this._modalNotice = null;
-        this._render();
+        this._renderModalPortal();
         break;
       case "prompt-cancel":
         this._modalConfirm = "cancel";
         this._modalNotice = null;
-        this._render();
+        this._renderModalPortal();
         break;
       case "prompt-skip":
         if (this._modalSkipSelected.size > 0) {
           this._modalConfirm = "skip";
           this._modalNotice = null;
-          this._render();
+          this._renderModalPortal();
         }
         break;
       case "cancel-confirm":
         this._modalConfirm = null;
-        this._render();
+        this._renderModalPortal();
         break;
       case "confirm-pause":
         this._callControlService(
@@ -1473,12 +1600,12 @@ class PlasticSlingerGlanceCard extends HTMLElement {
           const cur = (p.print_objects || []).find((o) => o.is_current && !o.is_excluded);
           if (cur) this._modalSkipSelected.add(cur.name);
         }
-        this._render();
+        this._renderModalPortal();
         break;
       case "clear-skip":
         this._modalSkipSelected.clear();
         this._modalConfirm = null;
-        this._render();
+        this._renderModalPortal();
         break;
       case "confirm-skip": {
         const names = [...this._modalSkipSelected];
