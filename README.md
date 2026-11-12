@@ -86,7 +86,7 @@ severity:
   - warning
   - critical
 show_header: true
-show_empty: true
+show_empty: false
 tap_to_dismiss: false
 ```
 
@@ -97,6 +97,6 @@ tap_to_dismiss: false
 | `max_items` | `20` | Maximum number of active notification tiles to display (`1`–`200`). |
 | `severity` | *(all)* | Optional filter list or comma-separated string (`info`, `success`, `warning`, `critical`). |
 | `show_header` | `true` | Shows a top summary bar with active/critical/warning counts and a **Clear all** button when notifications are present. |
-| `show_empty` | `true` | When `false`, hides the card completely when there are no active notifications. |
+| `show_empty` | `false` | By default (`false`), collapses the card and its `<hui-card>` container to zero vertical space unless there is an active notification (stays visible while editing the dashboard). Set to `true` to always show an empty-state placeholder. |
 | `tap_to_dismiss` | `false` | When `true`, tapping a tile dismisses it immediately instead of opening the detail modal. |
 | `tap_url` | *(none)* | Optional path or URL to open from the detail modal `↗` button (supports `{printer_id}` and `{notification_id}`). |
