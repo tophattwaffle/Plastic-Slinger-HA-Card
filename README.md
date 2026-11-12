@@ -45,7 +45,7 @@ as a **JavaScript Module** under **Settings → Dashboards → ⋮ → Resources
 type: custom:plastic-slinger-glance-card
 ```
 
-### All options
+### All options (`custom:plastic-slinger-glance-card`)
 
 ```yaml
 type: custom:plastic-slinger-glance-card
@@ -61,4 +61,42 @@ show_empty: true
 | `snapshot_interval` | `5` | Seconds between camera snapshot refreshes while the dashboard is visible (`2`–`60`). |
 | `columns` | `2` | Grid columns (`1` or `2`). |
 | `show_empty` | `true` | When `false`, hides the card completely when no printers are active or held. |
-| `tap_url` | *(none)* | Optional path or URL to open instead of the built-in control modal when tapping a printing/paused tile (supports `{printer_id}`). |
+| `tap_url` | *(none)* | Optional path or URL to open from the modal header `↗` button (supports `{printer_id}`). |
+
+---
+
+## Notifications Card (`custom:plastic-slinger-notifications-card`)
+
+Included in the same `plastic-slinger-glance-card.js` bundle: renders active visual alerts from `sensor.plastic_slinger_notifications` using the exact same dark zinc-slate 16:9 tile design, status accent colors, authenticated image loading (`/api/plastic_slinger/notification_image/<id>`), and popup detail modal.
+
+### Minimal
+
+```yaml
+type: custom:plastic-slinger-notifications-card
+```
+
+### All options (`custom:plastic-slinger-notifications-card`)
+
+```yaml
+type: custom:plastic-slinger-notifications-card
+entity: sensor.plastic_slinger_notifications
+columns: 2
+max_items: 20
+severity:
+  - warning
+  - critical
+show_header: true
+show_empty: true
+tap_to_dismiss: false
+```
+
+| Option | Default | Description |
+| :--- | :--- | :--- |
+| `entity` | `sensor.plastic_slinger_notifications` | The Notifications sensor from the `plastic_slinger` integration. |
+| `columns` | `2` | Grid columns (`1` or `2`). |
+| `max_items` | `20` | Maximum number of active notification tiles to display (`1`–`200`). |
+| `severity` | *(all)* | Optional filter list or comma-separated string (`info`, `success`, `warning`, `critical`). |
+| `show_header` | `true` | Shows a top summary bar with active/critical/warning counts and a **Clear all** button when notifications are present. |
+| `show_empty` | `true` | When `false`, hides the card completely when there are no active notifications. |
+| `tap_to_dismiss` | `false` | When `true`, tapping a tile dismisses it immediately instead of opening the detail modal. |
+| `tap_url` | *(none)* | Optional path or URL to open from the detail modal `↗` button (supports `{printer_id}` and `{notification_id}`). |

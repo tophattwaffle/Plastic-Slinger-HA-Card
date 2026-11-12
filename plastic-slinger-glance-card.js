@@ -1,15 +1,18 @@
-// plastic-slinger-glance-card v1.1.1 — compact 2xX 16:9 active-print camera glance grid
-// with native popup printer control modal (Pause, Resume, Cancel, Chamber Light,
-// Auto-Unload, and 2D bed-map Skip Part).
+// plastic-slinger-glance-card v1.2.0 — compact 2xX 16:9 active-print camera glance grid
+// (`custom:plastic-slinger-glance-card`) with native popup printer control modal
+// (Pause, Resume, Cancel, Chamber Light, Auto-Unload, and 2D bed-map Skip Part),
+// plus `custom:plastic-slinger-notifications-card` for visual farm alerts with
+// snapshots/thumbnails, severity filtering, detail modal, and click-to-dismiss.
 //
-// Reads `sensor.plastic_slinger_active_prints` from the Plastic Slinger Home
-// Assistant integration (`plastic_slinger`) and fetches camera snapshots through
-// the integration's authenticated `/api/plastic_slinger/snapshot/<id>` endpoint
-// via `hass.fetchWithAuth`, so it works natively in browsers and the Home
+// Reads `sensor.plastic_slinger_active_prints` and `sensor.plastic_slinger_notifications`
+// from the Plastic Slinger Home Assistant integration (`plastic_slinger`) and fetches
+// camera snapshots and notification images through the integration's authenticated
+// `/api/plastic_slinger/snapshot/<id>` and `/api/plastic_slinger/notification_image/<id>`
+// endpoints via `hass.fetchWithAuth`, so it works natively in browsers and the Home
 // Assistant Mobile Companion App over LAN, Nabu Casa, or reverse proxies without
 // iframes or Ingress session cookies.
 
-const CARD_VERSION = "1.1.1";
+const CARD_VERSION = "1.2.0";
 
 console.info(
   `%c PLASTIC-SLINGER-GLANCE-CARD %c v${CARD_VERSION} `,
@@ -1630,6 +1633,901 @@ if (!customElements.get("plastic-slinger-glance-card")) {
   customElements.define("plastic-slinger-glance-card", PlasticSlingerGlanceCard);
 }
 
+class PlasticSlingerNotificationsCard extends HTMLElement {
+  constructor() {
+    super();
+    this._blobUrls = new Map();
+    this._fetchedKeys = new Map();
+    this._dismissedIds = new Set();
+    this._fetching = new Set();
+    this._modalNotificationId = null;
+    this._modalBusy = false;
+    this._portalHost = null;
+    this._portalRoot = null;
+    this._onKeyDown = (ev) => {
+      if (ev.key === "Escape" && this._modalNotificationId != null) {
+        this._closeModal();
+      }
+    };
+  }
+
+  setConfig(config) {
+    const cols = Number(config?.columns ?? 2);
+    const maxItems = Number(config?.max_items ?? 20);
+    let severities = null;
+    if (Array.isArray(config?.severity)) {
+      severities = config.severity.map((s) => String(s).toLowerCase().trim()).filter(Boolean);
+    } else if (typeof config?.severity === "string" && config.severity.trim()) {
+      severities = config.severity
+        .split(",")
+        .map((s) => s.toLowerCase().trim())
+        .filter(Boolean);
+    }
+
+    this._config = {
+      entity: "sensor.plastic_slinger_notifications",
+      tap_url: null,
+      show_empty: true,
+      show_header: true,
+      tap_to_dismiss: false,
+      ...config,
+      columns: cols === 1 ? 1 : 2,
+      max_items: Number.isFinite(maxItems) ? Math.max(1, Math.min(200, maxItems)) : 20,
+      _severities: severities && severities.length ? new Set(severities) : null,
+    };
+    this._signature = null;
+    if (this._hass) {
+      this._render();
+      this._refreshImages();
+    }
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (!this._config) return;
+    const stateObj = hass.states?.[this._config.entity];
+    const sig = stateObj
+      ? `${stateObj.state}|${stateObj.last_updated}|${JSON.stringify(stateObj.attributes?.notifications ?? [])}|${JSON.stringify(stateObj.attributes?.status_colors ?? {})}`
+      : "missing";
+    if (sig !== this._signature) {
+      this._signature = sig;
+      const currentIds = new Set((stateObj?.attributes?.notifications || []).map((n) => Number(n.id)));
+      for (const id of [...this._dismissedIds]) {
+        if (!currentIds.has(id)) this._dismissedIds.delete(id);
+      }
+      if (this._modalNotificationId != null && !currentIds.has(this._modalNotificationId)) {
+        this._closeModal(false);
+      }
+      this._render();
+      this._refreshImages();
+    }
+  }
+
+  getCardSize() {
+    const items = this._visibleNotifications();
+    if (!items.length) return this._config?.show_empty === false ? 0 : 1;
+    return Math.ceil(items.length / (this._config?.columns || 2)) * 2;
+  }
+
+  getGridOptions() {
+    return { columns: 12, rows: "auto" };
+  }
+
+  connectedCallback() {
+    if (!this.shadowRoot) this.attachShadow({ mode: "open" });
+    document.addEventListener("keydown", this._onKeyDown);
+    if (this._hass && this._config) {
+      this._render();
+      this._refreshImages();
+    }
+  }
+
+  disconnectedCallback() {
+    document.removeEventListener("keydown", this._onKeyDown);
+    this._destroyPortal();
+    for (const url of this._blobUrls.values()) {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {}
+    }
+    this._blobUrls.clear();
+    this._fetchedKeys.clear();
+  }
+
+  _ensurePortal() {
+    if (this._portalRoot && this._portalHost?.isConnected) {
+      return this._portalRoot;
+    }
+    this._destroyPortal();
+    const host = document.createElement("div");
+    host.setAttribute("data-ps-notifications-portal", "1");
+    document.body.appendChild(host);
+    this._portalHost = host;
+    this._portalRoot = host.attachShadow({ mode: "open" });
+    return this._portalRoot;
+  }
+
+  _destroyPortal() {
+    if (this._portalHost) {
+      try {
+        this._portalHost.remove();
+      } catch {}
+    }
+    this._portalHost = null;
+    this._portalRoot = null;
+  }
+
+  _statusColors() {
+    const stateObj = this._hass?.states?.[this._config?.entity];
+    const fallbackObj = this._hass?.states?.["sensor.plastic_slinger_active_prints"];
+    const cc = stateObj?.attributes?.status_colors || fallbackObj?.attributes?.status_colors || {};
+    return {
+      printing: cc.printing || DEFAULT_COLORS.printing,
+      complete: cc.complete || DEFAULT_COLORS.complete,
+      paused: cc.paused || DEFAULT_COLORS.paused,
+      failed: cc.failed || DEFAULT_COLORS.failed,
+    };
+  }
+
+  _visibleNotifications() {
+    const stateObj = this._hass?.states?.[this._config?.entity];
+    const raw = Array.isArray(stateObj?.attributes?.notifications) ? stateObj.attributes.notifications : [];
+    const sevFilter = this._config?._severities;
+    const filtered = raw.filter((n) => {
+      if (!n || n.is_dismissed) return false;
+      const id = Number(n.id);
+      if (this._dismissedIds.has(id)) return false;
+      if (sevFilter) {
+        const sev = String(n.severity || "info").toLowerCase();
+        if (!sevFilter.has(sev)) return false;
+      }
+      return true;
+    });
+    return filtered.slice(0, this._config?.max_items || 20);
+  }
+
+  async _refreshImages() {
+    if (!this._hass || !this.shadowRoot) return;
+    const items = this._visibleNotifications();
+    const activeIds = new Set(items.map((n) => Number(n.id)));
+
+    for (const [id, url] of this._blobUrls.entries()) {
+      if (!activeIds.has(id)) {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {}
+        this._blobUrls.delete(id);
+        this._fetchedKeys.delete(id);
+      }
+    }
+
+    for (const n of items) {
+      if (!n.has_image) continue;
+      const id = Number(n.id);
+      const versionKey = `${id}|${n.updated_at_ts || n.created_at_ts || 0}`;
+      if (this._fetchedKeys.get(id) === versionKey && this._blobUrls.has(id)) {
+        continue;
+      }
+      this._fetchOneImage(id, versionKey);
+    }
+  }
+
+  async _fetchOneImage(notificationId, versionKey) {
+    if (this._fetching.has(notificationId) || !this._hass) return;
+    this._fetching.add(notificationId);
+    try {
+      const resp = await this._hass.fetchWithAuth(
+        `/api/plastic_slinger/notification_image/${notificationId}?v=${encodeURIComponent(versionKey)}`
+      );
+      if (!resp || !resp.ok) return;
+      const blob = await resp.blob();
+      if (!blob || blob.size === 0) return;
+
+      const newUrl = URL.createObjectURL(blob);
+      const oldUrl = this._blobUrls.get(notificationId);
+      this._blobUrls.set(notificationId, newUrl);
+      this._fetchedKeys.set(notificationId, versionKey);
+      if (oldUrl) {
+        try {
+          URL.revokeObjectURL(oldUrl);
+        } catch {}
+      }
+
+      for (const root of [this.shadowRoot, this._portalRoot]) {
+        if (!root) continue;
+        for (const img of root.querySelectorAll(`img[data-notification-id="${notificationId}"]`)) {
+          img.src = newUrl;
+          img.classList.add("loaded");
+        }
+      }
+    } catch {
+      // Keep placeholder on error
+    } finally {
+      this._fetching.delete(notificationId);
+    }
+  }
+
+  async _dismissNotification(notificationId) {
+    const id = Number(notificationId);
+    this._dismissedIds.add(id);
+    if (this._modalNotificationId === id) {
+      this._closeModal(false);
+    }
+    this._render();
+    try {
+      await this._hass.callService("plastic_slinger", "dismiss_notification", {
+        notification_id: id,
+      });
+    } catch {
+      this._dismissedIds.delete(id);
+      this._render();
+    }
+  }
+
+  async _dismissAllNotifications() {
+    const items = this._visibleNotifications();
+    if (!items.length || !this._hass) return;
+    const ids = items.map((n) => Number(n.id));
+    for (const id of ids) this._dismissedIds.add(id);
+    this._closeModal(false);
+    this._render();
+    try {
+      await this._hass.callService("plastic_slinger", "dismiss_all_notifications", {});
+    } catch {
+      for (const id of ids) this._dismissedIds.delete(id);
+      this._render();
+    }
+  }
+
+  _openModal(notificationId) {
+    this._modalNotificationId = Number(notificationId);
+    this._modalBusy = false;
+    this._renderModalPortal();
+  }
+
+  _closeModal(shouldRender = true) {
+    this._modalNotificationId = null;
+    this._modalBusy = false;
+    this._destroyPortal();
+    if (shouldRender) this._render();
+  }
+
+  _openActionUrl(n) {
+    const raw = this._config?.tap_url || n?.action_url;
+    if (!raw || typeof raw !== "string") return;
+    const url = raw
+      .replace(/\{printer_id\}/g, String(n?.printer_id ?? ""))
+      .replace(/\{notification_id\}/g, String(n?.id ?? ""));
+    if (url.startsWith("/")) {
+      history.pushState(null, "", url);
+      window.dispatchEvent(new CustomEvent("location-changed", { composed: true }));
+    } else if (url.startsWith("http://") || url.startsWith("https://")) {
+      window.open(url, "_blank", "noopener");
+    }
+  }
+
+  _formatRelativeTime(tsSeconds) {
+    const ts = Number(tsSeconds);
+    if (!Number.isFinite(ts) || ts <= 0) return "";
+    const diffSec = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+    if (diffSec < 45) return "Just now";
+    if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
+    return `${Math.floor(diffSec / 86400)}d ago`;
+  }
+
+  _severityInfo(severity) {
+    const sev = String(severity || "info").toLowerCase();
+    if (sev === "critical") return { cls: "is-failed", label: "CRITICAL", key: "failed" };
+    if (sev === "warning") return { cls: "is-paused", label: "WARNING", key: "paused" };
+    if (sev === "success") return { cls: "is-complete", label: "COMPLETE", key: "complete" };
+    return { cls: "is-printing", label: "INFO", key: "printing" };
+  }
+
+  _render() {
+    if (!this.shadowRoot || !this._config) return;
+    const stateObj = this._hass?.states?.[this._config.entity];
+    const colors = this._statusColors();
+    const items = this._visibleNotifications();
+    const cols = this._config.columns || 2;
+
+    if (stateObj && items.length === 0 && this._config.show_empty === false) {
+      this.shadowRoot.innerHTML = `<style>:host { display: none; }</style>`;
+      this._destroyPortal();
+      return;
+    }
+
+    const critCount = items.filter((n) => String(n.severity || "").toLowerCase() === "critical").length;
+    const warnCount = items.filter((n) => String(n.severity || "").toLowerCase() === "warning").length;
+
+    let headerHtml = "";
+    if (items.length > 0 && this._config.show_header !== false) {
+      headerHtml = `
+        <div class="feed-bar">
+          <div class="feed-bar-left">
+            <span class="feed-title">Notifications</span>
+            <span class="feed-pill">${items.length} active</span>
+            ${critCount > 0 ? `<span class="feed-pill crit">${critCount} critical</span>` : ""}
+            ${warnCount > 0 ? `<span class="feed-pill warn">${warnCount} warning</span>` : ""}
+          </div>
+          <button type="button" class="clear-all-btn" data-clear-all="1" title="Dismiss all notifications">
+            Clear all
+          </button>
+        </div>`;
+    }
+
+    let bodyHtml = "";
+    if (!stateObj) {
+      bodyHtml = `
+        <div class="empty">
+          <span class="empty-title">Plastic Slinger Notifications</span>
+          <span class="empty-sub">Waiting for <code>${esc(this._config.entity)}</code>…</span>
+        </div>`;
+    } else if (stateObj.state === "unavailable") {
+      bodyHtml = `
+        <div class="empty">
+          <span class="empty-title">Plastic Slinger unreachable</span>
+          <span class="empty-sub">Notifications will reappear automatically when the service responds.</span>
+        </div>`;
+    } else if (items.length === 0) {
+      bodyHtml = `
+        <div class="empty">
+          <span class="empty-title">No active notifications</span>
+          <span class="empty-sub">Printer, spaghetti, order, and inventory alerts appear here automatically.</span>
+        </div>`;
+    } else {
+      bodyHtml = `
+        ${headerHtml}
+        <div class="grid cols-${cols}">
+          ${items.map((n) => this._renderTile(n)).join("")}
+        </div>`;
+    }
+
+    this.shadowRoot.innerHTML = `
+      <style>
+        :host {
+          display: block;
+          --glance-printing: ${esc(colors.printing)};
+          --glance-complete: ${esc(colors.complete)};
+          --glance-paused: ${esc(colors.paused)};
+          --glance-failed: ${esc(colors.failed)};
+          --ps-teal: #14967f;
+          --ps-teal-bright: #2dd4bf;
+          --ps-bg: #18181b;
+          --ps-surface: #202024;
+          --ps-elevated: #28282d;
+          --ps-border: #34343b;
+          --ps-text: #f4f4f6;
+          --ps-muted: #9ca3af;
+          font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+        }
+        ha-card {
+          background: transparent;
+          border: none;
+          box-shadow: none;
+          padding: 0;
+          color: var(--ps-text);
+        }
+        .empty {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          justify-content: center;
+          gap: 3px;
+          padding: 14px 16px;
+          border-radius: 10px;
+          background: var(--ps-surface);
+          border: 1px solid var(--ps-border);
+          text-align: center;
+        }
+        .empty-title {
+          font-size: 13px;
+          font-weight: 600;
+          color: var(--ps-text);
+        }
+        .empty-sub {
+          font-size: 11.5px;
+          color: var(--ps-muted);
+        }
+        .feed-bar {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          margin-bottom: 8px;
+          padding: 6px 10px;
+          border-radius: 9px;
+          background: var(--ps-surface);
+          border: 1px solid var(--ps-border);
+        }
+        .feed-bar-left {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          flex-wrap: wrap;
+          min-width: 0;
+        }
+        .feed-title {
+          font-size: 12.5px;
+          font-weight: 700;
+          color: var(--ps-text);
+        }
+        .feed-pill {
+          font-size: 10.5px;
+          font-weight: 700;
+          padding: 2px 7px;
+          border-radius: 999px;
+          background: rgba(255, 255, 255, 0.08);
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          color: #d1d5db;
+        }
+        .feed-pill.crit {
+          background: color-mix(in srgb, var(--glance-failed) 24%, transparent);
+          border-color: color-mix(in srgb, var(--glance-failed) 65%, transparent);
+          color: #fca5a5;
+        }
+        .feed-pill.warn {
+          background: color-mix(in srgb, var(--glance-paused) 24%, transparent);
+          border-color: color-mix(in srgb, var(--glance-paused) 65%, transparent);
+          color: #fdba74;
+        }
+        .clear-all-btn {
+          height: 24px;
+          padding: 0 9px;
+          border-radius: 6px;
+          border: 1px solid var(--ps-border);
+          background: var(--ps-elevated);
+          color: var(--ps-text);
+          font-size: 11px;
+          font-weight: 700;
+          cursor: pointer;
+          flex: none;
+        }
+        .clear-all-btn:hover {
+          background: #323238;
+        }
+        .grid {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 8px;
+        }
+        .grid.cols-1 {
+          grid-template-columns: minmax(0, 1fr);
+        }
+        .tile {
+          position: relative;
+          display: flex;
+          flex-direction: column;
+          border-radius: 10px;
+          overflow: hidden;
+          background: var(--ps-surface);
+          border: 1.5px solid color-mix(in srgb, var(--tile-accent) 70%, var(--ps-border));
+          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+          user-select: none;
+          -webkit-tap-highlight-color: transparent;
+          cursor: pointer;
+          transition: transform 0.12s ease, border-color 0.15s ease;
+        }
+        .tile:active {
+          transform: scale(0.988);
+        }
+        .tile.is-printing { --tile-accent: var(--glance-printing); }
+        .tile.is-complete { --tile-accent: var(--glance-complete); }
+        .tile.is-paused   { --tile-accent: var(--glance-paused); }
+        .tile.is-failed   { --tile-accent: var(--glance-failed); }
+
+        .head {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 6px;
+          padding: 6px 8px;
+          background: color-mix(in srgb, var(--tile-accent) 16%, var(--ps-elevated));
+          border-bottom: 1px solid color-mix(in srgb, var(--tile-accent) 32%, var(--ps-border));
+          min-width: 0;
+        }
+        .title-wrap {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          min-width: 0;
+          flex: 1;
+        }
+        .dot {
+          width: 8px;
+          height: 8px;
+          border-radius: 50%;
+          flex: none;
+          background: var(--tile-accent);
+          box-shadow: 0 0 6px var(--tile-accent);
+        }
+        .name {
+          font-size: 12.5px;
+          font-weight: 700;
+          color: var(--ps-text);
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .occ-badge {
+          font-size: 10px;
+          font-weight: 800;
+          padding: 1px 5px;
+          border-radius: 999px;
+          background: rgba(255, 255, 255, 0.12);
+          color: #f4f4f6;
+          flex: none;
+        }
+        .head-right {
+          display: flex;
+          align-items: center;
+          gap: 5px;
+          flex: none;
+        }
+        .status {
+          font-size: 10px;
+          font-weight: 800;
+          letter-spacing: 0.04em;
+          padding: 2px 6px;
+          border-radius: 999px;
+          color: #fff;
+          background: color-mix(in srgb, var(--tile-accent) 82%, #000);
+          border: 1px solid color-mix(in srgb, var(--tile-accent) 60%, #fff);
+          line-height: 1.2;
+        }
+        .dismiss {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 20px;
+          height: 20px;
+          margin: -2px -2px -2px 0;
+          padding: 0;
+          border-radius: 5px;
+          border: 1px solid rgba(255, 255, 255, 0.22);
+          background: rgba(0, 0, 0, 0.35);
+          color: var(--ps-text);
+          font-size: 14px;
+          font-weight: 700;
+          line-height: 1;
+          cursor: pointer;
+        }
+        .dismiss:hover {
+          background: rgba(255, 255, 255, 0.16);
+        }
+
+        .cam {
+          position: relative;
+          width: 100%;
+          aspect-ratio: 16 / 9;
+          background-color: #121215;
+          background-image:
+            linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+          background-size: 16px 16px;
+          overflow: hidden;
+          display: flex;
+          flex-direction: column;
+          justify-content: flex-end;
+        }
+        .cam-img {
+          position: absolute;
+          inset: 0;
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+          opacity: 0;
+          transition: opacity 0.15s ease;
+        }
+        .cam-img.loaded {
+          opacity: 1;
+        }
+        .alert-scrim {
+          position: relative;
+          z-index: 1;
+          width: 100%;
+          box-sizing: border-box;
+          padding: 10px 9px 8px 9px;
+          background: linear-gradient(
+            180deg,
+            rgba(15, 15, 18, 0.25) 0%,
+            rgba(15, 15, 18, 0.86) 45%,
+            rgba(15, 15, 18, 0.96) 100%
+          );
+          display: flex;
+          flex-direction: column;
+          gap: 3px;
+        }
+        .cam.no-image .alert-scrim {
+          height: 100%;
+          justify-content: center;
+          background: radial-gradient(
+            circle at top left,
+            color-mix(in srgb, var(--tile-accent) 18%, rgba(18, 18, 21, 0.95)),
+            rgba(18, 18, 21, 0.98) 70%
+          );
+        }
+        .alert-title {
+          font-size: 12px;
+          font-weight: 700;
+          color: var(--ps-text);
+          line-height: 1.25;
+          display: -webkit-box;
+          -webkit-line-clamp: 2;
+          -webkit-box-orient: vertical;
+          overflow: hidden;
+        }
+        .alert-msg {
+          font-size: 11px;
+          color: #d1d5db;
+          line-height: 1.3;
+          display: -webkit-box;
+          -webkit-line-clamp: 2;
+          -webkit-box-orient: vertical;
+          overflow: hidden;
+        }
+
+        .foot {
+          position: relative;
+          height: 24px;
+          background: var(--ps-bg);
+          border-top: 1px solid var(--ps-border);
+          overflow: hidden;
+          display: flex;
+          align-items: center;
+        }
+        .foot-text {
+          position: relative;
+          z-index: 1;
+          width: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 6px;
+          padding: 0 8px;
+          font-size: 11px;
+          line-height: 1;
+        }
+        .pct {
+          font-weight: 700;
+          color: var(--ps-text);
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          min-width: 0;
+          flex: 1;
+        }
+        .sub {
+          font-weight: 600;
+          font-variant-numeric: tabular-nums;
+          color: var(--ps-muted);
+          white-space: nowrap;
+          flex: none;
+        }
+      </style>
+      <ha-card>${bodyHtml}</ha-card>`;
+
+    this._bindEvents();
+    this._renderModalPortal();
+  }
+
+  _renderTile(n) {
+    const id = Number(n.id);
+    const sev = this._severityInfo(n.severity);
+    const blobUrl = this._blobUrls.get(id) || "";
+    const hasImg = Boolean(n.has_image);
+    const headName = n.printer_name || n.category || "Plastic Slinger";
+    const occCount = Number(n.occurrence_count || 1);
+    const relTime = this._formatRelativeTime(n.updated_at_ts || n.created_at_ts);
+    const footLeft = n.file_name || n.category || n.event_type || "";
+
+    return `
+      <div class="tile ${sev.cls}"
+           data-notification-tile-id="${id}"
+           title="${esc(n.title || "")}">
+        <div class="head">
+          <div class="title-wrap">
+            <span class="dot" aria-hidden="true"></span>
+            <span class="name">${esc(headName)}</span>
+            ${occCount > 1 ? `<span class="occ-badge">×${occCount}</span>` : ""}
+          </div>
+          <div class="head-right">
+            <span class="status">${esc(sev.label)}</span>
+            <button type="button"
+                    class="dismiss"
+                    data-dismiss-notification-id="${id}"
+                    title="Dismiss alert"
+                    aria-label="Dismiss ${esc(n.title || "alert")}">×</button>
+          </div>
+        </div>
+        <div class="cam ${hasImg ? "has-image" : "no-image"}">
+          ${
+            hasImg
+              ? `<img data-notification-id="${id}"
+                      class="cam-img ${blobUrl ? "loaded" : ""}"
+                      ${blobUrl ? `src="${esc(blobUrl)}"` : ""}
+                      alt="${esc(n.title || "Notification image")}" />`
+              : ""
+          }
+          <div class="alert-scrim">
+            <div class="alert-title">${esc(n.title || "")}</div>
+            <div class="alert-msg">${esc(n.message || "")}</div>
+          </div>
+        </div>
+        <div class="foot">
+          <div class="foot-text">
+            <span class="pct">${esc(footLeft)}</span>
+            <span class="sub">${esc(relTime)}</span>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  _renderModalPortal() {
+    if (this._modalNotificationId == null) {
+      this._destroyPortal();
+      return;
+    }
+    const items = this._visibleNotifications();
+    const n = items.find((x) => Number(x.id) === this._modalNotificationId) || null;
+    if (!n) {
+      this._closeModal(false);
+      return;
+    }
+    const root = this._ensurePortal();
+    const colors = this._statusColors();
+    const sev = this._severityInfo(n.severity);
+    const accent = colors[sev.key] || colors.printing;
+    const id = Number(n.id);
+    const blobUrl = this._blobUrls.get(id) || "";
+    const occCount = Number(n.occurrence_count || 1);
+    const relTime = this._formatRelativeTime(n.updated_at_ts || n.created_at_ts);
+
+    root.innerHTML = `
+      <style>${MODAL_STYLES}
+        .notif-detail-body {
+          padding: 12px 14px;
+          background: var(--ps-bg);
+          border-top: 1px solid var(--ps-border);
+          border-bottom: 1px solid var(--ps-border);
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+        }
+        .notif-detail-title {
+          font-size: 14px;
+          font-weight: 800;
+          color: var(--ps-text);
+          line-height: 1.3;
+        }
+        .notif-detail-msg {
+          font-size: 12.5px;
+          color: #d1d5db;
+          line-height: 1.45;
+          white-space: pre-wrap;
+        }
+        .notif-meta-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+          margin-top: 4px;
+        }
+      </style>
+      <div class="modal-backdrop" data-modal-backdrop="1">
+        <div class="modal-card" style="--tile-accent: ${esc(accent)}" role="dialog" aria-modal="true" aria-label="${esc(n.title || "Alert details")}">
+          <div class="modal-head">
+            <div class="modal-title-group">
+              <span class="dot" aria-hidden="true"></span>
+              <span class="modal-name">${esc(n.printer_name || n.category || "Plastic Slinger")}</span>
+              ${n.machine_type ? `<span class="modal-badge">${esc(n.machine_type)}</span>` : ""}
+              ${n.printer_group ? `<span class="modal-badge">${esc(n.printer_group)}</span>` : ""}
+              ${occCount > 1 ? `<span class="modal-badge">×${occCount}</span>` : ""}
+              <span class="status">${esc(sev.label)}</span>
+            </div>
+            <div class="modal-head-btns">
+              ${
+                this._config?.tap_url || n.action_url
+                  ? `<button type="button" class="icon-btn" data-notif-modal-action="open-url" title="Open in Plastic Slinger" aria-label="Open in Plastic Slinger">↗</button>`
+                  : ""
+              }
+              <button type="button" class="icon-btn" data-notif-modal-action="close" title="Close" aria-label="Close">×</button>
+            </div>
+          </div>
+
+          ${
+            n.has_image
+              ? `<div class="cam">
+                  <span class="cam-placeholder">${esc(n.printer_name || n.category || "Snapshot")}</span>
+                  <img data-notification-id="${id}"
+                       class="cam-img ${blobUrl ? "loaded" : ""}"
+                       ${blobUrl ? `src="${esc(blobUrl)}"` : ""}
+                       alt="${esc(n.title || "Notification image")}" />
+                </div>`
+              : ""
+          }
+
+          <div class="notif-detail-body">
+            <div class="notif-detail-title">${esc(n.title || "")}</div>
+            <div class="notif-detail-msg">${esc(n.message || "")}</div>
+            <div class="notif-meta-row">
+              ${n.category ? `<span class="modal-badge">${esc(n.category)}</span>` : ""}
+              ${n.file_name ? `<span class="modal-badge">${esc(n.file_name)}</span>` : ""}
+              ${relTime ? `<span class="modal-badge">${esc(relTime)}</span>` : ""}
+            </div>
+          </div>
+
+          <div class="modal-deck">
+            <div class="action-row">
+              <button type="button" class="pill-btn ok" data-notif-modal-action="dismiss" ${this._modalBusy ? "disabled" : ""}>
+                ✓ Dismiss Alert
+              </button>
+              <button type="button" class="pill-btn" data-notif-modal-action="close">
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>`;
+
+    const backdrop = root.querySelector(".modal-backdrop[data-modal-backdrop]");
+    if (backdrop) {
+      backdrop.addEventListener("click", (ev) => {
+        if (ev.target === backdrop) this._closeModal();
+      });
+    }
+    for (const btn of root.querySelectorAll("[data-notif-modal-action]")) {
+      btn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const act = btn.dataset.notifModalAction;
+        if (act === "close") {
+          this._closeModal();
+        } else if (act === "dismiss") {
+          this._dismissNotification(id);
+        } else if (act === "open-url") {
+          this._closeModal();
+          this._openActionUrl(n);
+        }
+      });
+    }
+  }
+
+  _bindEvents() {
+    if (!this.shadowRoot) return;
+    const clearBtn = this.shadowRoot.querySelector("button[data-clear-all]");
+    if (clearBtn) {
+      clearBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        this._dismissAllNotifications();
+      });
+    }
+    for (const btn of this.shadowRoot.querySelectorAll("button[data-dismiss-notification-id]")) {
+      btn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        this._dismissNotification(btn.dataset.dismissNotificationId);
+      });
+    }
+    for (const tile of this.shadowRoot.querySelectorAll(".tile[data-notification-tile-id]")) {
+      tile.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const id = Number(tile.dataset.notificationTileId);
+        if (this._config?.tap_to_dismiss) {
+          this._dismissNotification(id);
+        } else {
+          this._openModal(id);
+        }
+      });
+    }
+  }
+}
+
+if (!customElements.get("plastic-slinger-notifications-card")) {
+  customElements.define("plastic-slinger-notifications-card", PlasticSlingerNotificationsCard);
+}
+
 window.customCards = window.customCards || [];
 if (!window.customCards.some((c) => c.type === "plastic-slinger-glance-card")) {
   window.customCards.push({
@@ -1637,6 +2535,15 @@ if (!window.customCards.some((c) => c.type === "plastic-slinger-glance-card")) {
     name: "Plastic Slinger Glance Card",
     description:
       "Compact 2xX 16:9 active-print camera glance grid with native printer control modal, status colors, and click-to-dismiss.",
+    preview: true,
+  });
+}
+if (!window.customCards.some((c) => c.type === "plastic-slinger-notifications-card")) {
+  window.customCards.push({
+    type: "plastic-slinger-notifications-card",
+    name: "Plastic Slinger Notifications Card",
+    description:
+      "Visual farm alert tiles styled to match the glance card with camera/PrintGuard snapshots, severity filtering, detail modal, and click-to-dismiss.",
     preview: true,
   });
 }
