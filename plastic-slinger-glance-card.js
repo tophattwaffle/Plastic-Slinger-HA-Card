@@ -1,8 +1,9 @@
-// plastic-slinger-glance-card v1.2.0 — compact 2xX 16:9 active-print camera glance grid
+// plastic-slinger-glance-card v1.2.1 — compact 2xX 16:9 active-print camera glance grid
 // (`custom:plastic-slinger-glance-card`) with native popup printer control modal
 // (Pause, Resume, Cancel, Chamber Light, Auto-Unload, and 2D bed-map Skip Part),
 // plus `custom:plastic-slinger-notifications-card` for visual farm alerts with
-// snapshots/thumbnails, severity filtering, detail modal, and click-to-dismiss.
+// snapshots/thumbnails, severity filtering, detail modal, click-to-dismiss, and
+// zero-height auto-collapse when no alerts are active.
 //
 // Reads `sensor.plastic_slinger_active_prints` and `sensor.plastic_slinger_notifications`
 // from the Plastic Slinger Home Assistant integration (`plastic_slinger`) and fetches
@@ -12,7 +13,7 @@
 // Assistant Mobile Companion App over LAN, Nabu Casa, or reverse proxies without
 // iframes or Ingress session cookies.
 
-const CARD_VERSION = "1.2.0";
+const CARD_VERSION = "1.2.1";
 
 console.info(
   `%c PLASTIC-SLINGER-GLANCE-CARD %c v${CARD_VERSION} `,
@@ -1644,11 +1645,38 @@ class PlasticSlingerNotificationsCard extends HTMLElement {
     this._modalBusy = false;
     this._portalHost = null;
     this._portalRoot = null;
+    this._editMode = false;
+    this._preview = false;
+    this._isCollapsed = false;
     this._onKeyDown = (ev) => {
       if (ev.key === "Escape" && this._modalNotificationId != null) {
         this._closeModal();
       }
     };
+  }
+
+  get editMode() {
+    return this._editMode;
+  }
+
+  set editMode(value) {
+    const next = Boolean(value);
+    if (this._editMode !== next) {
+      this._editMode = next;
+      this._render();
+    }
+  }
+
+  get preview() {
+    return this._preview;
+  }
+
+  set preview(value) {
+    const next = Boolean(value);
+    if (this._preview !== next) {
+      this._preview = next;
+      this._render();
+    }
   }
 
   setConfig(config) {
@@ -1667,7 +1695,7 @@ class PlasticSlingerNotificationsCard extends HTMLElement {
     this._config = {
       entity: "sensor.plastic_slinger_notifications",
       tap_url: null,
-      show_empty: true,
+      show_empty: false,
       show_header: true,
       tap_to_dismiss: false,
       ...config,
@@ -1705,20 +1733,72 @@ class PlasticSlingerNotificationsCard extends HTMLElement {
 
   getCardSize() {
     const items = this._visibleNotifications();
-    if (!items.length) return this._config?.show_empty === false ? 0 : 1;
+    if (!items.length) return this._config?.show_empty === true ? 1 : 0;
     return Math.ceil(items.length / (this._config?.columns || 2)) * 2;
   }
 
   getGridOptions() {
+    const items = this._visibleNotifications();
+    if (!items.length && this._config?.show_empty !== true && !this._isEditOrPreview()) {
+      return { columns: 12, rows: 0, min_rows: 0 };
+    }
     return { columns: 12, rows: "auto" };
+  }
+
+  _isEditOrPreview() {
+    if (this._editMode || this._preview) return true;
+    try {
+      if (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("edit") === "1") {
+        return true;
+      }
+      let el = this.parentElement;
+      while (el) {
+        const tag = el.tagName ? el.tagName.toUpperCase() : "";
+        if (tag === "HUI-CARD-PREVIEW" || tag === "HUI-CARD-OPTIONS" || el.classList?.contains("edit-mode")) {
+          return true;
+        }
+        el = el.parentElement || el.getRootNode?.()?.host || null;
+      }
+    } catch {}
+    return false;
+  }
+
+  _setCollapsed(collapsed) {
+    const prev = this._isCollapsed;
+    this._isCollapsed = collapsed;
+    const huiCard =
+      this.closest?.("hui-card") ||
+      (this.parentElement?.tagName?.toUpperCase() === "HUI-CARD" ? this.parentElement : null);
+    if (collapsed) {
+      this.style.display = "none";
+      this.setAttribute("hidden", "");
+      if (huiCard) {
+        huiCard.style.display = "none";
+        huiCard.setAttribute("hidden", "");
+      }
+    } else {
+      this.style.display = "";
+      this.removeAttribute("hidden");
+      if (huiCard) {
+        huiCard.style.display = "";
+        huiCard.removeAttribute("hidden");
+      }
+    }
+    if (prev !== collapsed && this.isConnected) {
+      this.dispatchEvent(new CustomEvent("card-visibility-changed", { bubbles: true, composed: true }));
+      this.dispatchEvent(new CustomEvent("iron-resize", { bubbles: true, composed: true }));
+    }
   }
 
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: "open" });
     document.addEventListener("keydown", this._onKeyDown);
-    if (this._hass && this._config) {
+    if (this._config) {
       this._render();
-      this._refreshImages();
+      if (this._hass) {
+        this._refreshImages();
+      }
+      this.dispatchEvent(new CustomEvent("card-visibility-changed", { bubbles: true, composed: true }));
     }
   }
 
@@ -1931,11 +2011,14 @@ class PlasticSlingerNotificationsCard extends HTMLElement {
     const items = this._visibleNotifications();
     const cols = this._config.columns || 2;
 
-    if (stateObj && items.length === 0 && this._config.show_empty === false) {
-      this.shadowRoot.innerHTML = `<style>:host { display: none; }</style>`;
+    if (items.length === 0 && this._config.show_empty !== true && !this._isEditOrPreview()) {
+      this.shadowRoot.innerHTML = `<style>:host { display: none !important; margin: 0 !important; padding: 0 !important; height: 0 !important; min-height: 0 !important; border: 0 !important; }</style>`;
       this._destroyPortal();
+      this._setCollapsed(true);
       return;
     }
+
+    this._setCollapsed(false);
 
     const critCount = items.filter((n) => String(n.severity || "").toLowerCase() === "critical").length;
     const warnCount = items.filter((n) => String(n.severity || "").toLowerCase() === "warning").length;
